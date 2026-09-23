@@ -216,3 +216,30 @@ def test_handle_chat_dead_token_marks_auth_failed(monkeypatch):
 
     assert _status_of(resp) == 401, resp
     assert calls["limited"] == [(1, "auth")]
+
+
+# ---- recover_cooldown_tokens (主动恢复) -----------------------------------
+
+def test_recover_cooldown_tokens(tmp_path, monkeypatch):
+    now = time.time()
+    rows = [
+        (1, "a", "t", "ACTIVE", None),
+        (2, "b", "t", "RATE_LIMITED", now - 1000),  # 冷却已过 -> 恢复
+        (3, "c", "t", "RATE_LIMITED", now - 10),    # 冷却未到 -> 不动
+        (4, "d", "t", "RATE_LIMITED", None),        # 历史无 limited_at -> 恢复
+        (5, "e", "t", "AUTH_FAILED", None),         # 失效 -> 不动
+    ]
+    _fresh_db(tmp_path, monkeypatch, rows)
+
+    n = functions.recover_cooldown_tokens()
+    assert n == 2
+
+    conn = functions.get_db()
+    statuses = dict(conn.execute("SELECT id, status FROM tokens").fetchall())
+    limited = dict(conn.execute("SELECT id, limited_at FROM tokens").fetchall())
+    conn.close()
+    assert statuses[2] == "ACTIVE" and limited[2] is None
+    assert statuses[4] == "ACTIVE"
+    assert statuses[3] == "RATE_LIMITED"
+    assert statuses[1] == "ACTIVE"
+    assert statuses[5] == "AUTH_FAILED"

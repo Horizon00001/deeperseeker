@@ -451,6 +451,25 @@ def pick_token():
     return row[0] if row else None
 
 
+def recover_cooldown_tokens():
+    """主动把冷却期已过的 RATE_LIMITED 批量恢复为 ACTIVE，返回恢复数量。
+
+    与 pick_token 的懒恢复不同：这里不等调度，定期唤醒所有已冷却的号。
+    若这些号再次被上游 429，mark_limited 会把它们重新标回 RATE_LIMITED。
+    """
+    cutoff = time.time() - RATE_LIMIT_COOLDOWN
+    conn = get_db()
+    cur = conn.execute(
+        "UPDATE tokens SET status = 'ACTIVE', limited_at = NULL "
+        "WHERE status = 'RATE_LIMITED' AND (limited_at IS NULL OR limited_at <= ?)",
+        (cutoff,),
+    )
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
 def mark_limited(token_id, reason="rate_limit"):
     if reason == "auth":
         logger.warning("Token #%d marked AUTH_FAILED", token_id)

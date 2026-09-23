@@ -53,6 +53,7 @@ from functions import (
     next_parent,
     parse_tools,
     pick_token,
+    recover_cooldown_tokens,
     save_session,
     send_message,
     StreamToolParser,
@@ -148,11 +149,27 @@ def count_tok(text):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+async def _recover_rate_limited_loop():
+    """后台周期任务：主动把冷却已过的 RATE_LIMITED 恢复为 ACTIVE。"""
+    while True:
+        try:
+            n = recover_cooldown_tokens()
+            if n:
+                logger.info("Recovered %d rate-limited token(s) to ACTIVE", n)
+        except Exception:  # noqa: BLE001
+            logger.exception("rate-limited recovery loop failed")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     _install_key_access_formatter()
-    yield
+    recover_task = asyncio.create_task(_recover_rate_limited_loop())
+    try:
+        yield
+    finally:
+        recover_task.cancel()
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
