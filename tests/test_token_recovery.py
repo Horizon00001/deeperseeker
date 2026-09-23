@@ -40,7 +40,8 @@ def _fresh_db(tmp_path, monkeypatch, rows):
     conn = functions.get_db()
     conn.execute(
         "CREATE TABLE tokens (id INTEGER PRIMARY KEY, alias TEXT, token TEXT, "
-        "status TEXT, limited_at REAL)"
+        "status TEXT, limited_at REAL, limited_until REAL, "
+        "limited_streak INTEGER DEFAULT 0, recovered_at REAL)"
     )
     for r in rows:
         conn.execute(
@@ -243,3 +244,84 @@ def test_recover_cooldown_tokens(tmp_path, monkeypatch):
     assert statuses[3] == "RATE_LIMITED"
     assert statuses[1] == "ACTIVE"
     assert statuses[5] == "AUTH_FAILED"
+
+
+# ---- 冷却指数退避（刚恢复马上又限流则加倍） --------------------------------
+
+def test_mark_limited_doubles_cooldown_on_quick_relapse(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch, [(1, "a", "t", "ACTIVE", None)])
+
+    # 首次限流 -> streak=1, cooldown=300
+    functions.mark_limited(1, "rate_limit")
+    conn = functions.get_db()
+    r = conn.execute(
+        "SELECT limited_at, limited_until, limited_streak FROM tokens WHERE id=1"
+    ).fetchone()
+    conn.close()
+    assert r[2] == 1
+    assert round(r[1] - r[0]) == functions.RATE_LIMIT_COOLDOWN
+
+    # 模拟「刚恢复」后马上又限流 -> streak=2, cooldown 加倍
+    conn = functions.get_db()
+    conn.execute("UPDATE tokens SET status='ACTIVE', recovered_at=? WHERE id=1", (time.time(),))
+    conn.commit()
+    conn.close()
+    functions.mark_limited(1, "rate_limit")
+    conn = functions.get_db()
+    r = conn.execute(
+        "SELECT limited_at, limited_until, limited_streak FROM tokens WHERE id=1"
+    ).fetchone()
+    conn.close()
+    assert r[2] == 2
+    assert round(r[1] - r[0]) == functions.RATE_LIMIT_COOLDOWN * 2
+
+
+def test_mark_limited_resets_streak_after_grace(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch, [(1, "a", "t", "ACTIVE", None)])
+    # 上一次恢复远早于 grace 窗口 -> 视为新的一次，streak 回到 1
+    conn = functions.get_db()
+    conn.execute(
+        "UPDATE tokens SET recovered_at=? WHERE id=1",
+        (time.time() - functions.RECOVER_GRACE - 100,),
+    )
+    conn.commit()
+    conn.close()
+    functions.mark_limited(1, "rate_limit")
+    conn = functions.get_db()
+    r = conn.execute("SELECT limited_streak FROM tokens WHERE id=1").fetchone()
+    conn.close()
+    assert r[0] == 1
+
+
+def test_mark_limited_cooldown_capped(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch, [(1, "a", "t", "RATE_LIMITED", time.time())])
+    conn = functions.get_db()
+    conn.execute(
+        "UPDATE tokens SET recovered_at=?, limited_streak=10 WHERE id=1", (time.time(),)
+    )
+    conn.commit()
+    conn.close()
+    functions.mark_limited(1, "rate_limit")
+    conn = functions.get_db()
+    r = conn.execute(
+        "SELECT limited_at, limited_until FROM tokens WHERE id=1"
+    ).fetchone()
+    conn.close()
+    assert round(r[1] - r[0]) == functions.MAX_COOLDOWN
+
+
+def test_mark_active_clears_streak(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch, [(1, "a", "t", "RATE_LIMITED", time.time())])
+    conn = functions.get_db()
+    conn.execute("UPDATE tokens SET limited_streak=3, recovered_at=? WHERE id=1", (time.time(),))
+    conn.commit()
+    conn.close()
+    functions.mark_active(1)
+    conn = functions.get_db()
+    r = conn.execute(
+        "SELECT status, limited_streak, recovered_at FROM tokens WHERE id=1"
+    ).fetchone()
+    conn.close()
+    assert r[0] == "ACTIVE"
+    assert r[1] == 0
+    assert r[2] is None

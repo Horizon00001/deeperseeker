@@ -25,6 +25,13 @@ wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
 _db = os.getenv("DB_PATH", "deeperseeker.db")
 
+# Token 冷却与恢复策略
+RATE_LIMIT_COOLDOWN = int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "300"))
+# 恢复后多久内再次被限流算「刚恢复就挂」——这种情况冷却按 2 倍递增
+RECOVER_GRACE = int(os.getenv("DEEPSEEKER_RECOVER_GRACE", "90"))
+# 冷却上限，指数加倍不会超过它
+MAX_COOLDOWN = int(os.getenv("DEEPSEEKER_MAX_COOLDOWN", "3600"))
+
 
 def cookie_file_path():
     """Resolve where the DeepSeek cookie file lives.
@@ -74,7 +81,10 @@ def init_db():
             alias TEXT,
             token TEXT,
             status TEXT DEFAULT 'ACTIVE',
-            limited_at REAL
+            limited_at REAL,
+            limited_until REAL,
+            limited_streak INTEGER DEFAULT 0,
+            recovered_at REAL
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -89,13 +99,24 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # Existing installs predate limited_at; add it once. Historical
-    # RATE_LIMITED rows keep limited_at NULL so the cooldown-recovery path can
-    # re-validate them right away instead of waiting a full window.
-    try:
-        conn.execute("ALTER TABLE tokens ADD COLUMN limited_at REAL")
-    except sqlite3.OperationalError:
-        pass
+    # 迁移：老库补 token 冷却相关列（幂等）
+    for ddl in (
+        "ALTER TABLE tokens ADD COLUMN limited_at REAL",
+        "ALTER TABLE tokens ADD COLUMN limited_until REAL",
+        "ALTER TABLE tokens ADD COLUMN limited_streak INTEGER DEFAULT 0",
+        "ALTER TABLE tokens ADD COLUMN recovered_at REAL",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+    # 历史 RATE_LIMITED 行没有 limited_until，按原单向冷却回填；
+    # limited_at 为空（更老的库）保持 NULL，视为立即可恢复。
+    conn.execute(
+        "UPDATE tokens SET limited_until = limited_at + ? "
+        "WHERE status = 'RATE_LIMITED' AND limited_until IS NULL AND limited_at IS NOT NULL",
+        (RATE_LIMIT_COOLDOWN,),
+    )
     conn.commit()
     conn.close()
     try:
@@ -422,25 +443,30 @@ def delete_token(token_id):
     conn.close()
 
 
-RATE_LIMIT_COOLDOWN = int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "300"))
-
-
 def pick_token():
     conn = get_db()
     row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
     if row:
         conn.close()
         return row[0]
-    # A 429-limited token becomes usable again after the cooldown window;
-    # recover one in place so it is picked as ACTIVE from now on.
-    cutoff = time.time() - RATE_LIMIT_COOLDOWN
+    # A 429-limited token becomes usable again after its cooldown window
+    # (per-token limited_until, which grows on quick relapses); recover one in
+    # place so it is picked as ACTIVE from now on.
+    now = time.time()
+    cutoff = now - RATE_LIMIT_COOLDOWN
     row = conn.execute(
-        "SELECT id FROM tokens WHERE status = 'RATE_LIMITED' "
-        "AND (limited_at IS NULL OR limited_at <= ?) ORDER BY RANDOM() LIMIT 1",
-        (cutoff,),
+        "SELECT id FROM tokens WHERE status = 'RATE_LIMITED' AND ("
+        "(limited_until IS NOT NULL AND limited_until <= ?) "
+        "OR (limited_until IS NULL AND (limited_at IS NULL OR limited_at <= ?))) "
+        "ORDER BY RANDOM() LIMIT 1",
+        (now, cutoff),
     ).fetchone()
     if row:
-        conn.execute("UPDATE tokens SET status = 'ACTIVE', limited_at = NULL WHERE id = ?", (row[0],))
+        conn.execute(
+            "UPDATE tokens SET status = 'ACTIVE', limited_at = NULL, limited_until = NULL, "
+            "recovered_at = ? WHERE id = ?",
+            (now, row[0]),
+        )
         conn.commit()
         conn.close()
         return row[0]
@@ -457,12 +483,15 @@ def recover_cooldown_tokens():
     与 pick_token 的懒恢复不同：这里不等调度，定期唤醒所有已冷却的号。
     若这些号再次被上游 429，mark_limited 会把它们重新标回 RATE_LIMITED。
     """
-    cutoff = time.time() - RATE_LIMIT_COOLDOWN
+    now = time.time()
+    cutoff = now - RATE_LIMIT_COOLDOWN
     conn = get_db()
     cur = conn.execute(
-        "UPDATE tokens SET status = 'ACTIVE', limited_at = NULL "
-        "WHERE status = 'RATE_LIMITED' AND (limited_at IS NULL OR limited_at <= ?)",
-        (cutoff,),
+        "UPDATE tokens SET status = 'ACTIVE', limited_at = NULL, limited_until = NULL, "
+        "recovered_at = ? WHERE status = 'RATE_LIMITED' AND ("
+        "(limited_until IS NOT NULL AND limited_until <= ?) "
+        "OR (limited_until IS NULL AND (limited_at IS NULL OR limited_at <= ?)))",
+        (now, now, cutoff),
     )
     conn.commit()
     n = cur.rowcount
@@ -478,16 +507,39 @@ def mark_limited(token_id, reason="rate_limit"):
         conn.commit()
         conn.close()
         return
-    logger.warning("Token #%d marked RATE_LIMITED", token_id)
+    now = time.time()
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ?, limited_at = ? WHERE id = ?", ("RATE_LIMITED", time.time(), token_id))
+    row = conn.execute(
+        "SELECT limited_streak, recovered_at FROM tokens WHERE id = ?", (token_id,)
+    ).fetchone()
+    streak = 1
+    if row:
+        prev = row[0] or 0
+        recovered_at = row[1]
+        if recovered_at is not None and (now - recovered_at) <= RECOVER_GRACE:
+            streak = prev + 1  # 刚恢复马上就又限流：冷却加倍
+    cooldown = min(RATE_LIMIT_COOLDOWN * (2 ** (streak - 1)), MAX_COOLDOWN)
+    conn.execute(
+        "UPDATE tokens SET status = 'RATE_LIMITED', limited_at = ?, limited_until = ?, "
+        "limited_streak = ?, recovered_at = NULL WHERE id = ?",
+        (now, now + cooldown, streak, token_id),
+    )
     conn.commit()
     conn.close()
+    logger.warning(
+        "Token #%d marked RATE_LIMITED (streak=%d, cooldown=%ds)",
+        token_id, streak, cooldown,
+    )
 
 
 def mark_active(token_id):
+    """Token 成功服务了一次请求 —— 清空它的冷却/失败计数。"""
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("ACTIVE", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = 'ACTIVE', limited_at = NULL, limited_until = NULL, "
+        "limited_streak = 0, recovered_at = NULL WHERE id = ?",
+        (token_id,),
+    )
     conn.commit()
     conn.close()
 
@@ -496,11 +548,14 @@ def count_usable_tokens():
     """Tokens that can serve a request now: ACTIVE plus RATE_LIMITED whose
     cooldown has elapsed. AUTH_FAILED is excluded."""
     conn = get_db()
-    cutoff = time.time() - RATE_LIMIT_COOLDOWN
+    now = time.time()
+    cutoff = now - RATE_LIMIT_COOLDOWN
     row = conn.execute(
         "SELECT COUNT(*) FROM tokens WHERE status = 'ACTIVE' "
-        "OR (status = 'RATE_LIMITED' AND (limited_at IS NULL OR limited_at <= ?))",
-        (cutoff,),
+        "OR (status = 'RATE_LIMITED' AND ("
+        "(limited_until IS NOT NULL AND limited_until <= ?) "
+        "OR (limited_until IS NULL AND (limited_at IS NULL OR limited_at <= ?))))",
+        (now, cutoff),
     ).fetchone()
     conn.close()
     return row[0] if row else 0
