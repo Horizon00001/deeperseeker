@@ -73,7 +73,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT,
             token TEXT,
-            status TEXT DEFAULT 'ACTIVE'
+            status TEXT DEFAULT 'ACTIVE',
+            limited_at REAL
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -88,6 +89,13 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # Existing installs predate limited_at; add it once. Historical
+    # RATE_LIMITED rows keep limited_at NULL so the cooldown-recovery path can
+    # re-validate them right away instead of waiting a full window.
+    try:
+        conn.execute("ALTER TABLE tokens ADD COLUMN limited_at REAL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     try:
@@ -130,6 +138,36 @@ def _build_upstream_bases():
 
 
 UPSTREAM_BASES = _build_upstream_bases()
+
+# DeepSeek answers HTTP 200 even for fatal errors, e.g. an invalid token gives
+# {"code": 40003, "msg": "Authorization Failed (invalid token)", "data": null}.
+# Callers cannot rely on the HTTP status alone, so map these business codes to
+# a synthetic "HTTP 401:" so the existing _upstream_http_code()/mark_limited()
+# path marks the token AUTH_FAILED instead of crashing on a None subscript.
+_AUTH_BIZ_CODES = {40003}
+_AUTH_MSG_RE = re.compile(r"authorization|invalid token|not logged|unauthor|login", re.IGNORECASE)
+
+
+def _unwrap_biz(data, what):
+    """Return data['data']['biz_data'], raising an HTTP-coded exception on error.
+
+    A non-dict body, a null payload, or an auth-type business code becomes
+    "HTTP 401: ..." (token dead) while every other malformed/error reply
+    becomes "HTTP 502: ...". Never returns None silently: an empty biz_data is
+    the caller's signal to validate required fields.
+    """
+    if not isinstance(data, dict):
+        raise Exception(f"HTTP 502: {what}: non-JSON upstream response")
+    code = data.get("code")
+    payload = data.get("data")
+    if payload is None:
+        msg = str(data.get("msg") or "empty upstream data")[:200]
+        if code in _AUTH_BIZ_CODES or _AUTH_MSG_RE.search(msg):
+            raise Exception(f"HTTP 401: {msg}")
+        raise Exception(f"HTTP 502: {what}: code={code} {msg}")
+    if not isinstance(payload, dict):
+        raise Exception(f"HTTP 502: {what}: malformed upstream payload")
+    return payload.get("biz_data")
 
 
 async def post_with_failover(path, *, headers, session=None, **kwargs):
@@ -384,21 +422,46 @@ def delete_token(token_id):
     conn.close()
 
 
+RATE_LIMIT_COOLDOWN = int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "300"))
+
+
 def pick_token():
     conn = get_db()
     row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
     if row:
         conn.close()
         return row[0]
+    # A 429-limited token becomes usable again after the cooldown window;
+    # recover one in place so it is picked as ACTIVE from now on.
+    cutoff = time.time() - RATE_LIMIT_COOLDOWN
+    row = conn.execute(
+        "SELECT id FROM tokens WHERE status = 'RATE_LIMITED' "
+        "AND (limited_at IS NULL OR limited_at <= ?) ORDER BY RANDOM() LIMIT 1",
+        (cutoff,),
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE tokens SET status = 'ACTIVE', limited_at = NULL WHERE id = ?", (row[0],))
+        conn.commit()
+        conn.close()
+        return row[0]
+    # Legacy fallback: nothing is recoverable, still hand back the oldest token
+    # so the caller can try it (it may have recovered upstream).
     row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
     conn.close()
     return row[0] if row else None
 
 
-def mark_limited(token_id):
+def mark_limited(token_id, reason="rate_limit"):
+    if reason == "auth":
+        logger.warning("Token #%d marked AUTH_FAILED", token_id)
+        conn = get_db()
+        conn.execute("UPDATE tokens SET status = ?, limited_at = NULL WHERE id = ?", ("AUTH_FAILED", token_id))
+        conn.commit()
+        conn.close()
+        return
     logger.warning("Token #%d marked RATE_LIMITED", token_id)
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("RATE_LIMITED", token_id))
+    conn.execute("UPDATE tokens SET status = ?, limited_at = ? WHERE id = ?", ("RATE_LIMITED", time.time(), token_id))
     conn.commit()
     conn.close()
 
@@ -408,6 +471,20 @@ def mark_active(token_id):
     conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("ACTIVE", token_id))
     conn.commit()
     conn.close()
+
+
+def count_usable_tokens():
+    """Tokens that can serve a request now: ACTIVE plus RATE_LIMITED whose
+    cooldown has elapsed. AUTH_FAILED is excluded."""
+    conn = get_db()
+    cutoff = time.time() - RATE_LIMIT_COOLDOWN
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tokens WHERE status = 'ACTIVE' "
+        "OR (status = 'RATE_LIMITED' AND (limited_at IS NULL OR limited_at <= ?))",
+        (cutoff,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
 
 
 def find_session(sig):
@@ -1057,7 +1134,10 @@ async def create_challange_pow(target_path, auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["challenge"]
+    biz = _unwrap_biz(data, "create_pow_challenge")
+    if not isinstance(biz, dict) or not biz.get("challenge"):
+        raise Exception("HTTP 502: create_pow_challenge returned no challenge")
+    return biz["challenge"]
 
 
 def write_string_pow(text, alloc_func, memory, store):
@@ -1101,7 +1181,11 @@ async def create_new_chat(auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["chat_session"]["id"]
+    biz = _unwrap_biz(data, "chat_session/create")
+    chat_session = biz.get("chat_session") if isinstance(biz, dict) else None
+    if not isinstance(chat_session, dict) or not chat_session.get("id"):
+        raise Exception("HTTP 502: chat_session/create returned no session")
+    return chat_session["id"]
 
 
 _EMPTY_SSE_DEFAULT = (
@@ -1378,10 +1462,12 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     )
     async with response:
         resp_json = await response.json()
-    file_id = resp_json["data"]["biz_data"]["id"]
+    js_data = _unwrap_biz(resp_json, "file/upload_file")
+    if not isinstance(js_data, dict) or not js_data.get("id"):
+        raise Exception("HTTP 502: file/upload_file returned no file id")
+    file_id = js_data["id"]
     yield ("uploaded", file_id)
-    js_data = resp_json["data"]["biz_data"]
-    status = js_data["status"]
+    status = js_data.get("status")
     headers = get_headers(auth_token)
     deadline = time.time() + 300
     while status in ["PENDING", "PARSING"] and time.time() < deadline:
@@ -1393,7 +1479,11 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            _biz = _unwrap_biz(await resp.json(), "file/fetch_files")
+            _files = _biz.get("files") if isinstance(_biz, dict) else None
+            if not isinstance(_files, list) or not _files:
+                raise Exception("HTTP 502: file/fetch_files returned no files")
+            js_data = _files[0]
         status = js_data["status"]
     if status == "SUCCESS":
         tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
@@ -1419,7 +1509,11 @@ async def get_file_content(auth_token, file_id):
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
-    js_data = resp_json["data"]["biz_data"]["files"][0]
+    biz = _unwrap_biz(resp_json, "file/fetch_files")
+    files = biz.get("files") if isinstance(biz, dict) else None
+    if not isinstance(files, list) or not files:
+        raise Exception("HTTP 502: file/fetch_files returned no files")
+    js_data = files[0]
     yield mimetypes.guess_type(js_data["file_name"])[0]
     deadline = time.time() + 60
     while js_data.get("status") in ("PENDING", "PARSING") and time.time() < deadline and not js_data.get("signed_path"):
@@ -1430,7 +1524,11 @@ async def get_file_content(auth_token, file_id):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            _biz = _unwrap_biz(await resp.json(), "file/fetch_files")
+            _files = _biz.get("files") if isinstance(_biz, dict) else None
+            if not isinstance(_files, list) or not _files:
+                raise Exception("HTTP 502: file/fetch_files returned no files")
+            js_data = _files[0]
     if not js_data.get("signed_path"):
         return
     file_path = "https://files.deepseeksvc.com/api" + js_data["signed_path"] + "&ty=r"

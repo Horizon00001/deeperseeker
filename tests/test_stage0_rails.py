@@ -828,7 +828,7 @@ def test_handle_chat_retry_surrenders_lock_before_recursing():
             ("send_message", fake_send),
             ("extract_and_upload_files", fake_files),
             ("build_prompt", fake_prompt),
-            ("mark_limited", lambda tid: None),
+            ("mark_limited", lambda tid, reason="rate_limit": None),
             ("mark_active", lambda tid: None),
             ("delete_sessions_for_chat", fake_delete),
             ("save_session", fake_save),

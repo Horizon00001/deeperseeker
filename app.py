@@ -39,6 +39,7 @@ from functions import (
     cookie_file_path,
     add_token,
     count_tokens,
+    count_usable_tokens,
     create_new_chat,
     delete_token,
     delete_sessions_for_chat,
@@ -424,9 +425,9 @@ async def handle_chat(
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = get_token(token_id)
-        if not tok or tok["status"] == "RATE_LIMITED":
+        if not tok or tok["status"] != "ACTIVE":
             new_token_id = pick_token()
-            if new_token_id and (not tok or new_token_id != token_id):
+            if new_token_id and new_token_id != token_id:
                 new_tok = get_token(new_token_id)
                 if new_tok:
                     _set_key_name(new_tok.get("alias"))
@@ -512,21 +513,41 @@ async def handle_chat(
                 # that summary via build_prompt(rollover_summary=...). A single large
                 # first exchange is untouched (the first-message path accepts ~1M
                 # tokens); this only fires for accumulated session context.
-                if needs_rollover(messages):
-                    scratch_chat = await create_new_chat(tok["token"])
-                    summary_gen = send_message(
-                        scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
-                    )
-                    summary = strip_summary_tags(await collect_response(summary_gen))
-                    rollover_summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
-                    logger.info(
-                        "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
-                        count_tok(rollover_summary), scratch_chat,
-                    )
+                # create_new_chat can fail with a synthetic HTTP 401/429 when the
+                # picked token is dead or limited (upstream replies HTTP 200 with
+                # a business error body). Mark that token and rotate to another
+                # one so a bad token yields a clean error, not a 500.
+                tried_tokens = {token_id}
+                while True:
+                    try:
+                        if needs_rollover(messages):
+                            scratch_chat = await create_new_chat(tok["token"])
+                            summary_gen = send_message(
+                                scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                            )
+                            summary = strip_summary_tags(await collect_response(summary_gen))
+                            rollover_summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
+                            logger.info(
+                                "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
+                                count_tok(rollover_summary), scratch_chat,
+                            )
 
-                session_id = await create_new_chat(tok["token"])
-                save_session(sig, token_id, session_id, 0)
-                parent_message_id = 0
+                        session_id = await create_new_chat(tok["token"])
+                        save_session(sig, token_id, session_id, 0)
+                        parent_message_id = 0
+                        break
+                    except Exception as e:
+                        code = _upstream_http_code(e)
+                        if code in (401, 403, 429):
+                            mark_limited(token_id, "auth" if code in (401, 403) else "rate_limit")
+                        next_token_id = pick_token()
+                        if not next_token_id or next_token_id in tried_tokens:
+                            return _api_error_response(e, is_anthropic)
+                        tried_tokens.add(next_token_id)
+                        token_id = next_token_id
+                        tok = get_token(token_id)
+                        if not tok:
+                            return _api_error_response(e, is_anthropic)
             else:
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
@@ -538,19 +559,25 @@ async def handle_chat(
     _set_key_name(tok.get("alias"))
 
     if parent_message_id != 0 and needs_rollover(messages):
-        logger.info(
-            "Context rollover: accumulated context over limit; purging session mappings for chat %s",
-            session_id,
-        )
-        delete_sessions_for_chat(token_id, session_id)
-        scratch_chat = await create_new_chat(tok["token"])
-        summary_gen = send_message(
-            scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
-        )
-        rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
-        session_id = await create_new_chat(tok["token"])
-        save_session(sig, token_id, session_id, 0)
-        parent_message_id = 0
+        try:
+            logger.info(
+                "Context rollover: accumulated context over limit; purging session mappings for chat %s",
+                session_id,
+            )
+            delete_sessions_for_chat(token_id, session_id)
+            scratch_chat = await create_new_chat(tok["token"])
+            summary_gen = send_message(
+                scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+            )
+            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+            session_id = await create_new_chat(tok["token"])
+            save_session(sig, token_id, session_id, 0)
+            parent_message_id = 0
+        except Exception as e:
+            code = _upstream_http_code(e)
+            if code in (401, 403, 429):
+                mark_limited(token_id, "auth" if code in (401, 403) else "rate_limit")
+            return _api_error_response(e, is_anthropic)
 
     is_first = parent_message_id == 0
     # Stage 0.3: hold this chat's lock across the whole send -> save critical
@@ -592,7 +619,7 @@ async def handle_chat(
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            mark_limited(token_id, "auth" if code in (401, 403) else "rate_limit")
             delete_sessions_for_chat(token_id, session_id)
             if not _auth_rotated:
                 new_token_id = pick_token()
@@ -740,7 +767,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            mark_limited(token_id, "auth" if code in (401, 403) else "rate_limit")
             delete_sessions_for_chat(token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
@@ -863,7 +890,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            mark_limited(token_id, "auth" if code in (401, 403) else "rate_limit")
             delete_sessions_for_chat(token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
@@ -1045,10 +1072,17 @@ async def files_upload(request: Request):
     filename = getattr(file_obj, "filename", "file.bin")
     content_type = getattr(file_obj, "content_type", "application/octet-stream")
     file_info = None
-    async for status, data in upload_file(file_bytes, filename, content_type, tok["token"]):
-        if status == "success":
-            file_info = data
-            break
+    try:
+        async for status, data in upload_file(file_bytes, filename, content_type, tok["token"]):
+            if status == "success":
+                file_info = data
+                break
+    except Exception as e:
+        code = _upstream_http_code(e)
+        if code in (401, 403, 429):
+            mark_limited(tok_id, "auth" if code in (401, 403) else "rate_limit")
+            return JSONResponse({"error": "Token unavailable"}, status_code=code)
+        return JSONResponse({"error": "Upload failed"}, status_code=502)
     if not file_info:
         return JSONResponse({"error": "Upload failed"}, status_code=500)
 
@@ -1087,7 +1121,11 @@ async def files_content(file_id: str, request: Request):
         mime = await gen.__anext__()
     except StopAsyncIteration:
         return JSONResponse({"error": "File not found"}, status_code=404)
-    except Exception:
+    except Exception as e:
+        code = _upstream_http_code(e)
+        if code in (401, 403, 429):
+            mark_limited(tok_id, "auth" if code in (401, 403) else "rate_limit")
+            return JSONResponse({"error": "Token unavailable"}, status_code=code)
         return JSONResponse({"error": "File fetch failed"}, status_code=502)
     async def stream_chunks():
         async for chunk in gen:
@@ -1527,7 +1565,9 @@ async def root(request: Request):
 
 @app.get("/health")
 async def health(request: Request):
-    active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
+    # Count ACTIVE plus cooldown-elapsed RATE_LIMITED tokens; AUTH_FAILED is
+    # excluded so dead tokens can no longer keep the instance "ok".
+    active = count_usable_tokens()
     cookies_valid = False
     try:
         with open(cookie_file_path()) as f:

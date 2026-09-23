@@ -50,7 +50,7 @@
                 <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                 <td>
                     <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
-                        {{ tok['status'] }}
+                        {% if tok['status'] == 'AUTH_FAILED' %}AUTH_FAILED (token invalid){% else %}{{ tok['status'] }}{% endif %}
                     </span>
                 </td>
                 <td>
